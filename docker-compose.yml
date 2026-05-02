@@ -1,0 +1,72 @@
+version: '3.9'
+
+services:
+  # ── Backend (Auth + Messaging in monorepo for local dev) ──
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+      target: builder      # use builder stage for hot-reload in dev
+    container_name: chatsphere-backend
+    restart: unless-stopped
+    ports:
+      - "5001:5001"
+    environment:
+      - NODE_ENV=development
+      - PORT=5001
+    env_file:
+      - ./backend/.env
+    volumes:
+      - ./backend/src:/app/src   # hot reload in dev
+    networks:
+      - chatsphere-net
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:5001/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    command: ["node", "src/index.js"]
+
+  # ── Frontend ──────────────────────────────────────────────
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      target: builder
+    container_name: chatsphere-frontend
+    restart: unless-stopped
+    ports:
+      - "5173:5173"
+    environment:
+      - NODE_ENV=development
+    volumes:
+      - ./frontend/src:/app/src
+    networks:
+      - chatsphere-net
+    depends_on:
+      - backend
+    command: ["npm", "run", "dev", "--", "--host", "0.0.0.0"]
+
+  # ── Nginx Reverse Proxy ───────────────────────────────────
+  nginx:
+    image: nginx:1.25-alpine
+    container_name: chatsphere-nginx
+    restart: unless-stopped
+    ports:
+      - "80:80"
+    volumes:
+      - ./docker/nginx-dev.conf:/etc/nginx/conf.d/default.conf:ro
+    networks:
+      - chatsphere-net
+    depends_on:
+      - backend
+      - frontend
+
+networks:
+  chatsphere-net:
+    driver: bridge
+
+volumes:
+  node_modules_backend:
+  node_modules_frontend:

@@ -1,0 +1,11 @@
+---
+# Master playbook — runs all roles in order
+- name: Configure all ChatSphere servers
+  hosts: jenkins
+  become: true
+  gather_facts: true
+  roles:
+    - security
+    - docker
+    - kubectl
+    - jenkins

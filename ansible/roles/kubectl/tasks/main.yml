@@ -1,0 +1,22 @@
+---
+- name: Install kubectl
+  shell: |
+    curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+    chmod +x kubectl
+    mv kubectl /usr/local/bin/kubectl
+  args:
+    creates: /usr/local/bin/kubectl
+
+- name: Configure kubectl for EKS
+  shell: aws eks update-kubeconfig --name chatsphere-cluster --region ap-south-1
+  become_user: ubuntu
+  environment:
+    HOME: /home/ubuntu
+  ignore_errors: yes
+
+- name: Verify kubectl
+  command: kubectl version --client
+  register: kubectl_version
+
+- name: Show kubectl version
+  debug: msg="{{ kubectl_version.stdout }}"

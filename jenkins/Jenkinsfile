@@ -1,0 +1,148 @@
+pipeline {
+    agent any
+
+    environment {
+        AWS_REGION      = "ap-south-1"
+        ECR_REGISTRY    = credentials("ECR_REGISTRY")     // set in Jenkins credentials
+        IMAGE_TAG       = "${BUILD_NUMBER}"
+        CLUSTER_NAME    = "chatsphere-cluster"
+        K8S_NAMESPACE   = "chatsphere"
+    }
+
+    stages {
+
+        stage("Checkout") {
+            steps {
+                checkout scm
+                echo "Building branch: ${env.BRANCH_NAME} | Build #${BUILD_NUMBER}"
+            }
+        }
+
+        stage("Install & Test") {
+            parallel {
+                stage("Backend Tests") {
+                    steps {
+                        dir("backend") {
+                            sh "npm ci"
+                            sh "npm test --if-present"
+                        }
+                    }
+                }
+                stage("Frontend Build") {
+                    steps {
+                        dir("frontend") {
+                            sh "npm ci"
+                            sh "npm run build"
+                        }
+                    }
+                }
+            }
+        }
+
+        stage("Build Docker Images") {
+            steps {
+                sh """
+                    docker build -t ${ECR_REGISTRY}/chatsphere-backend:${IMAGE_TAG} \
+                                 -t ${ECR_REGISTRY}/chatsphere-backend:latest ./backend
+                    docker build -t ${ECR_REGISTRY}/chatsphere-frontend:${IMAGE_TAG} \
+                                 -t ${ECR_REGISTRY}/chatsphere-frontend:latest ./frontend
+                """
+            }
+        }
+
+        stage("Push to AWS ECR") {
+            steps {
+                sh """
+                    aws ecr get-login-password --region ${AWS_REGION} | \
+                    docker login --username AWS --password-stdin ${ECR_REGISTRY}
+
+                    docker push ${ECR_REGISTRY}/chatsphere-backend:${IMAGE_TAG}
+                    docker push ${ECR_REGISTRY}/chatsphere-backend:latest
+                    docker push ${ECR_REGISTRY}/chatsphere-frontend:${IMAGE_TAG}
+                    docker push ${ECR_REGISTRY}/chatsphere-frontend:latest
+                """
+            }
+        }
+
+        stage("Configure kubectl") {
+            steps {
+                sh "aws eks update-kubeconfig --name ${CLUSTER_NAME} --region ${AWS_REGION}"
+            }
+        }
+
+        stage("Create K8s Namespace & Secrets") {
+            steps {
+                sh """
+                    kubectl apply -f k8s/base/namespace.yaml
+                    kubectl apply -f k8s/base/configmap.yaml
+                """
+                withCredentials([
+                    string(credentialsId: "MONGODB_URI",            variable: "MONGODB_URI"),
+                    string(credentialsId: "JWT_SECRET",             variable: "JWT_SECRET"),
+                    string(credentialsId: "CLOUDINARY_CLOUD_NAME",  variable: "CLOUDINARY_CLOUD_NAME"),
+                    string(credentialsId: "CLOUDINARY_API_KEY",     variable: "CLOUDINARY_API_KEY"),
+                    string(credentialsId: "CLOUDINARY_API_SECRET",  variable: "CLOUDINARY_API_SECRET")
+                ]) {
+                    sh """
+                        kubectl create secret generic chatsphere-secrets \
+                            --from-literal=MONGODB_URI="\$MONGODB_URI" \
+                            --from-literal=JWT_SECRET="\$JWT_SECRET" \
+                            --from-literal=CLOUDINARY_CLOUD_NAME="\$CLOUDINARY_CLOUD_NAME" \
+                            --from-literal=CLOUDINARY_API_KEY="\$CLOUDINARY_API_KEY" \
+                            --from-literal=CLOUDINARY_API_SECRET="\$CLOUDINARY_API_SECRET" \
+                            -n ${K8S_NAMESPACE} --dry-run=client -o yaml | kubectl apply -f -
+                    """
+                }
+            }
+        }
+
+        stage("Deploy to EKS") {
+            steps {
+                sh """
+                    # Update image tags in manifests
+                    sed -i "s|ACCOUNT_ID.dkr.ecr.ap-south-1.amazonaws.com/chatsphere-backend:IMAGE_TAG|${ECR_REGISTRY}/chatsphere-backend:${IMAGE_TAG}|g" k8s/base/backend-deployment.yaml
+                    sed -i "s|ACCOUNT_ID.dkr.ecr.ap-south-1.amazonaws.com/chatsphere-frontend:IMAGE_TAG|${ECR_REGISTRY}/chatsphere-frontend:${IMAGE_TAG}|g" k8s/base/frontend-deployment.yaml
+
+                    kubectl apply -f k8s/base/backend-deployment.yaml
+                    kubectl apply -f k8s/base/frontend-deployment.yaml
+                    kubectl apply -f k8s/base/ingress.yaml
+                """
+            }
+        }
+
+        stage("Verify Rollout") {
+            steps {
+                sh """
+                    kubectl rollout status deployment/chatsphere-backend  -n ${K8S_NAMESPACE} --timeout=180s
+                    kubectl rollout status deployment/chatsphere-frontend -n ${K8S_NAMESPACE} --timeout=120s
+                    kubectl get pods -n ${K8S_NAMESPACE}
+                """
+            }
+        }
+
+        stage("Deploy Frontend to S3") {
+            steps {
+                withCredentials([string(credentialsId: "S3_BUCKET_NAME", variable: "S3_BUCKET"),
+                                 string(credentialsId: "CLOUDFRONT_ID",  variable: "CF_ID")]) {
+                    sh """
+                        aws s3 sync frontend/dist/ s3://\$S3_BUCKET --delete --region ${AWS_REGION}
+                        aws cloudfront create-invalidation --distribution-id \$CF_ID --paths "/*"
+                        echo "Frontend deployed to CloudFront"
+                    """
+                }
+            }
+        }
+    }
+
+    post {
+        success {
+            echo "ChatSphere deployed successfully! Build #${BUILD_NUMBER}"
+        }
+        failure {
+            echo "Deployment FAILED — Check console output above"
+        }
+        always {
+            sh "docker image prune -f || true"
+        }
+    }
+}
