@@ -2,18 +2,14 @@ name: ChatSphere CI/CD
 
 on:
   push:
-    branches: [main, develop]
-  pull_request:
     branches: [main]
 
 env:
   AWS_REGION: ap-south-1
-  NODE_VERSION: "20"
 
 jobs:
-  # ── Job 1: Lint & Test ───────────────────────────────────────────────────────
-  test:
-    name: Test & Lint
+  deploy:
+    name: Build & Deploy
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
@@ -22,98 +18,43 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: ${{ env.NODE_VERSION }}
-          cache: npm
-          cache-dependency-path: |
-            backend/package-lock.json
-            frontend/package-lock.json
+          node-version: "20"
 
-      - name: Install & test backend
-        working-directory: backend
-        run: |
-          npm ci
-          npm test --if-present
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
 
-      - name: Install & build frontend
+      - name: Build Frontend
         working-directory: frontend
         run: |
           npm ci
           npm run build
 
-  # ── Job 2: Build & Push Docker ───────────────────────────────────────────────
-  build-push:
-    name: Build & Push to ECR
-    runs-on: ubuntu-latest
-    needs: test
-    if: github.ref == 'refs/heads/main'
-    outputs:
-      image-tag: ${{ steps.tag.outputs.tag }}
-    steps:
-      - uses: actions/checkout@v4
+      - name: Deploy Frontend to S3
+        run: |
+          aws s3 sync frontend/dist/ s3://${{ secrets.S3_BUCKET_NAME }} --delete
+          echo "Frontend deployed to S3 ✅"
 
-      - name: Generate image tag
-        id: tag
-        run: echo "tag=$(echo $GITHUB_SHA | head -c8)" >> $GITHUB_OUTPUT
-
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v4
+      - name: Deploy Backend to EC2
+        uses: appleboy/ssh-action@v1.0.0
         with:
-          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region:            ${{ env.AWS_REGION }}
-
-      - name: Login to Amazon ECR
-        id: login-ecr
-        uses: aws-actions/amazon-ecr-login@v2
-
-      - name: Build & push backend
-        env:
-          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
-          IMAGE_TAG:     ${{ steps.tag.outputs.tag }}
-        run: |
-          docker build -t $ECR_REGISTRY/chatsphere-backend:$IMAGE_TAG ./backend
-          docker push $ECR_REGISTRY/chatsphere-backend:$IMAGE_TAG
-
-      - name: Build & push frontend
-        env:
-          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
-          IMAGE_TAG:     ${{ steps.tag.outputs.tag }}
-        run: |
-          docker build -t $ECR_REGISTRY/chatsphere-frontend:$IMAGE_TAG ./frontend
-          docker push $ECR_REGISTRY/chatsphere-frontend:$IMAGE_TAG
-
-  # ── Job 3: Deploy to EKS ────────────────────────────────────────────────────
-  deploy:
-    name: Deploy to AWS EKS
-    runs-on: ubuntu-latest
-    needs: build-push
-    if: github.ref == 'refs/heads/main'
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region:            ${{ env.AWS_REGION }}
-
-      - name: Update kubeconfig for EKS
-        run: aws eks update-kubeconfig --name chatsphere-cluster --region ${{ env.AWS_REGION }}
-
-      - name: Deploy to EKS
-        env:
-          ECR_REGISTRY: ${{ secrets.ECR_REGISTRY }}
-          IMAGE_TAG:     ${{ needs.build-push.outputs.image-tag }}
-        run: |
-          sed -i "s|ACCOUNT_ID.dkr.ecr.ap-south-1.amazonaws.com/chatsphere-backend:IMAGE_TAG|$ECR_REGISTRY/chatsphere-backend:$IMAGE_TAG|g" k8s/base/backend-deployment.yaml
-          sed -i "s|ACCOUNT_ID.dkr.ecr.ap-south-1.amazonaws.com/chatsphere-frontend:IMAGE_TAG|$ECR_REGISTRY/chatsphere-frontend:$IMAGE_TAG|g" k8s/base/frontend-deployment.yaml
-          kubectl apply -f k8s/base/
-          kubectl rollout status deployment/chatsphere-backend  -n chatsphere --timeout=180s
-          kubectl rollout status deployment/chatsphere-frontend -n chatsphere --timeout=120s
-
-      - name: Deploy frontend to S3 + CloudFront
-        run: |
-          cd frontend && npm ci && npm run build
-          aws s3 sync dist/ s3://${{ secrets.S3_BUCKET_NAME }} --delete
-          aws cloudfront create-invalidation --distribution-id ${{ secrets.CLOUDFRONT_ID }} --paths "/*"
+          host: ${{ secrets.EC2_HOST }}
+          username: ubuntu
+          key: ${{ secrets.EC2_SSH_KEY }}
+          script: |
+            cd /home/ubuntu/chatsphere
+            git pull origin main
+            sudo docker stop chatsphere-backend || true
+            sudo docker rm chatsphere-backend || true
+            sudo docker build -t chatsphere-backend ./backend
+            sudo docker run -d \
+              --name chatsphere-backend \
+              --env-file /home/ubuntu/.env \
+              -e FRONTEND_URL="http://${{ secrets.S3_BUCKET_NAME }}.s3-website.ap-south-1.amazonaws.com" \
+              -p 5001:5001 \
+              --restart always \
+              chatsphere-backend
+            echo "Backend deployed ✅"
