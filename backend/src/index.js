@@ -3,7 +3,6 @@ import dotenv from "dotenv";
 import cookieParser from "cookie-parser";
 import cors from "cors";
 import path from "path";
-
 import { connectDB } from "./lib/db.js";
 import authRoutes from "./routes/auth.route.js";
 import messageRoutes from "./routes/message.route.js";
@@ -17,13 +16,17 @@ const __dirname = path.resolve();
 app.use(express.json({ limit: "10mb" }));
 app.use(cookieParser());
 app.use(cors({
-  origin: process.env.NODE_ENV === "production"
-    ? process.env.FRONTEND_URL || "http://localhost:5173"
-    : "http://localhost:5173",
+  origin: [
+    "http://localhost:5173",
+    "http://chatsphere-frontend-56ed6f7f.s3-website.ap-south-1.amazonaws.com",
+    process.env.FRONTEND_URL,
+  ],
   credentials: true,
+  methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization", "Cookie"],
 }));
 
-// ── Health check (Kubernetes liveness/readiness probe) ──
+// ── Health check ──
 app.get("/health", (req, res) => {
   res.status(200).json({
     status: "healthy",
