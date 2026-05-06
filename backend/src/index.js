@@ -23,10 +23,10 @@ app.use(cors({
   ],
   credentials: true,
   methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-  allowedHeaders: ["Content-Type", "Authorization", "Cookie"],
+  allowedHeaders: ["Content-Type", "Authorization", "Cookie", "x-auth-token"],
+  exposedHeaders: ["x-auth-token"],
 }));
 
-// ── Health check ──
 app.get("/health", (req, res) => {
   res.status(200).json({
     status: "healthy",
